@@ -38,21 +38,33 @@ class ModulesWithDependencies:
 
 
 class StageRuntime(object):
-    def __init__(self, model, rank, inputs_module_destinations,
-                 configuration_maps, model_type):
+    def __init__(self, model, rank, world_size, inputs_module_destinations,
+                 configuration_maps, target_tensor_names, model_type):
         self.tensors = {}
         self.gradients = {}
 
         self.rank = rank
+        self.world_size = world_size
         self.model_type = model_type
+        self.target_tensor_names = target_tensor_names
         # inputs, outputs of stages
         self.input_names = {}
         self.output_names = {}
+        # inputs, outputs of criterion
+        self.criterion_input_names = {}
+        self.criterion_output_names = {}
         # send/recv between stages
         self.send_names = {}
         self.recv_names = {}
         self.send_ranks = {}
         self.receive_ranks = {}
+
+        self.fwd_idx = 0
+        self.bwd_idx = 0
+
+        self.optimizer = None
+
+        self.is_criterion = self.rank == self.world_size - 1
 
         self.initialize(model, inputs_module_destinations, configuration_maps)
 
@@ -65,6 +77,11 @@ class StageRuntime(object):
         self.input_names = all_input_names[self.rank]
         self.output_names = all_output_names[self.rank]
         self.sub_module = all_sub_modules[self.rank]
+        self.sub_module = self.sub_module.cuda()
+
+        self.criterion_input_names = all_input_names[-1]
+        self.criterion_output_names = all_output_names[-1]
+        self.criterion_module = all_sub_modules[-1]
 
         # print("rank", self.rank, self.input_names, self.output_names)
 
@@ -122,31 +139,75 @@ class StageRuntime(object):
         ## rank 2 ['out1'] ['out2'] {'out2': [3]} {'out1': [1]}
         ## rank 3 ['out2'] ['out3'] {} {'out2': [2]}
 
+    def set_loader(self, loader):
+        if loader is not None:
+            self.loader_iter = iter(loader)
+        else:
+            self.loader_iter = None
 
+    def train(self):
+        self.tensors = {}
+        self.gradients = {}
 
-    def do_forward(self):
+        self.fwd_idx = 0
+        self.bwd_idx = 0
+        self.sub_module.train()
+
+    def run_forward(self):
+        # print("---1 before tensors", self.tensors.keys())
         self.receive_tensors_forward()
+        # print("---2 before tensors", self.tensors.keys())
 
-        self._do_forward()
-
-        self.send_tensors_forward(self.outputs.copy(), self.target_tensors)
+        self._run_forward(self.tensors)
+        if self.rank == self.world_size - 1:
+            self._run_criterion(self.tensors)
+        # print("---3 before tensors", self.tensors.keys())
 
         self.update_fwd_idx()
 
-    def _do_forward(self, inputs):
-        outputs = {}
+    def _run_criterion(self, tensors):
+        # If layer is criterion (loss).
+        if self.model_type == SPEECH_TO_TEXT:
+            output = tensors["output"].transpose(0, 1).float()
+            output_sizes = tensors["output_sizes"].cpu()
+            target = tensors["target"].cpu()
+            target_sizes = tensors["target_length"].cpu()
+            input0_size = tensors["input0_size"].cpu()
+            module_outputs = [self.criterion_module(output, target, output_sizes, target_sizes) / input0_size[0]]
+        else:
+            # print("==== input_names", tensors, self.criterion_input_names)
+            module_outputs = [self.criterion_module(tensors[input_name], tensors["target"])
+                              for input_name in self.criterion_input_names]
+            module_outputs = [sum(module_outputs)]
 
-        module_outputs = self.net(*[inputs[input_name] for input_name in self.input_names])
+        for (output_name, module_output) in zip(self.criterion_output_names, module_outputs):
+            tensors[output_name] = module_output
+
+        self.output = tensors[self.criterion_input_names[0]]
+
+        if self.is_criterion and self.model_type == TRANSLATION:
+            loss_per_batch = tensors[self.criterion_input_names[0]] * tensors[self.criterion_input_name].size(1)
+            loss_per_token = loss_per_batch / tensors["target_length"][0].item()
+            self.loss = loss_per_token
+        elif self.is_criterion:
+            self.loss = tensors[self.criterion_output_names[0]]
+        else:
+            self.loss = 1
+
+    def _run_forward(self, tensors):
+        module_outputs = self.sub_module(*[tensors[input_name]
+                                           for input_name in self.input_names])
         if not isinstance(module_outputs, tuple):
             module_outputs = (module_outputs,)
+
         module_outputs = list(module_outputs)
+
+        # print("before tensors", tensors.keys())  before tensors dict_keys(['input0', 'target', 'out0'])
         for (output_name, module_output) in zip(self.output_names, module_outputs):
-            outputs[output_name] = module_output
+            tensors[output_name] = module_output
+        # print("after tensors", tensors.keys())  after tensors dict_keys(['input0', 'target', 'out0'])
 
-        return outputs
-
-
-    def do_backward(self, handler):
+    def _run_backward(self, handler):
         self.receive_tensors_backward()
 
         self._do_backward(self.gradients)
@@ -159,28 +220,52 @@ class StageRuntime(object):
         self.send_tensors_backward(grad_tensors)
         self.update_bwd_idx()
 
-    def _do_backward(self, outputs, grad_tensors):
-        if self.last_stage:
-            module_outputs = [self.criterion(
-                self.outputs[name], self.target_tensors["target"])
-                for name in self.output_names
-            ]
-            loss = sum(module_outputs)
-            self.loss = loss
-            loss.backward()
+    def run_backward(self, input_names, output_names):
+        inputs = {}
+        outputs = {}
+        input_gradients = {}
+        output_gradients = {}
 
-        else:
-            torch.autograd.backward(
-                tuple([self.outputs[name] for name in self.output_names]),
-                grad_tensors=tuple([grad_tensors[name] for name in self.output_names])
-            )
+        # get outputs
+        for output_name in output_names:
+            if output_name not in self.gradients:
+                output_gradients[output_name] = None
+            else:
+                output_gradients[output_name] = self.gradients[output_name]
+            if self.tensors[output_name].requires_grad:
+                outputs[output_name] = self.tensors[output_name]
 
-        grad_tensors = {}
-        for name in self.inputs:
-            if self.inputs[name].requires_grad:
-                grad_tensors[name] = self.inputs[name].grad.data.clone()
+        # get inputs
+        for input_name in input_names:
+            if input_name not in output_names:
+                inputs[input_name] = self.tensors[input_name]
 
-        return grad_tensors
+        # print("outputs", outputs, output_gradients)
+
+        # Hook to record input gradients
+        def hook_wrapper(input_name):
+            def hook(input_gradient):
+                input_gradients[input_name] = input_gradient
+            return hook
+
+        for input_name in inputs:
+            if input_name != "input0" and input_name != "input1" and input_name != "input2" \
+                    and inputs[input_name].requires_grad:
+                inputs[input_name].register_hook(hook_wrapper(input_name))
+
+        # perform backward pass
+        torch.autograd.backward(tuple([outputs[output_name] for output_name in outputs]),
+                                grad_tensors=tuple([output_gradients[output_name]
+                                                    for output_name in outputs]))
+
+        # Input tensors don't need gradients.
+        for input_name in inputs:
+            if not inputs[input_name].requires_grad:
+                self.gradients[input_name] = inputs[input_name]
+                continue
+
+            if input_name != "input0" and input_name != "input1" and input_name != "input2" and input_name != "input":
+                self.gradients[input_name] = input_gradients[input_name]
 
     def receive_tensors_forward(self):
         if self.loader_iter is not None:
@@ -199,17 +284,16 @@ class StageRuntime(object):
                                  dtype=torch.int).cuda()
             elif self.model_type == IMAGE_CLASSIFICATION:
                 (input, target) = input
-                self.tensors[-1]["input0"] = input.cuda(non_blocking=True)
-                self.tensors[-1]["target"] = target.cuda(non_blocking=True)
+                self.tensors["input0"] = input.cuda(non_blocking=True)
+                self.tensors["target"] = target.cuda(non_blocking=True)
             elif self.model_type == SPEECH_TO_TEXT:
                 input, target, input_percentages, target_sizes = input
                 input_sizes = input_percentages.mul_(int(input.size(3))).int()
-                self.tensors[-1]["input0"] = input.cuda(non_blocking=True)
-                self.tensors[-1]["input1"] = input_sizes.cuda(non_blocking=True)
-                self.tensors[-1]["target"] = target.cuda(non_blocking=True)
-                self.tensors[-1]["target_length"] = target_sizes.cuda(
+                self.tensors["input0"] = input.cuda(non_blocking=True)
+                self.tensors["input1"] = input_sizes.cuda(non_blocking=True)
+                self.tensors["target"] = target.cuda(non_blocking=True)
+                self.tensors["target_length"] = target_sizes.cuda(
                     non_blocking=True)
-
 
     def update_fwd_idx(self):
         self.fwd_idx += 1
